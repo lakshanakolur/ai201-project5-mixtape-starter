@@ -1,5 +1,20 @@
 # Mixtape — Codebase Map
 
+## AI Usage
+
+I used an AI assistant throughout this project, mostly for codebase orientation and as a second pair of eyes during debugging — not for blind bug-finding or code generation I didn't verify myself.
+
+**Milestone 1 (orientation):** I gave the assistant each service file and asked what it was responsible for and what its main functions did — that's what produced the file-by-file breakdown in "Main files" below. I also asked it to trace full data flows across files (e.g. "how does a song reach a friend's feed"), which is where I first noticed the read-only nature of the feed and the structural similarity between `add_to_playlist` and `rate_song` that turned into Issue #4 later. I treated these summaries as a starting map, not ground truth — I still opened and read every file myself before trusting a summary.
+
+**Milestone 2 (reproduction):** For Issue #1, I asked it to walk through exactly what app *state* was needed to hit the Sunday-specific code path, since I wasn't sure how to reproduce a day-of-week bug without literally waiting for a Sunday. It suggested calling `update_listening_streak()` directly with fixed datetimes instead of relying on the real clock, and pointed out that `tests/test_streaks.py` already had a test encoding that exact scenario. That was useful specifically because I'd already narrowed the problem down first — I wouldn't have thought to check whether an existing test already modeled the bug.
+
+**Milestone 3 (diagnosis and fixes):** For each bug, I had the assistant read the suspicious function and explain what could make it return the wrong value, then I checked that explanation against the actual code myself before accepting it. For Issue #1, its first pass at explaining the Sunday condition was directionally right but vague — it only tightened up once I gave it the actual bug report text. For Issue #4, I gave it `add_to_playlist` and `rate_song` side by side and asked what was structurally different between them, which is what cleanly surfaced the missing `create_notification()` call. For Issue #5, it read the query and the `[:-1]` slice together and connected the slice to the seeded "Friday Energy" playlist (7 songs), which is what made me confident the reproduction and root cause actually lined up before I touched any code.
+
+**Where I had to verify things myself, or where the AI fell short:**
+- The assistant couldn't actually run `pytest` in its own environment (no network access to install Flask/SQLAlchemy there), so for every fix it traced test cases by hand against the new code and I ran the real suite myself and reported back pass/fail each time, rather than trusting hand-traced reasoning alone.
+- While investigating Issue #5, it flagged — but was explicit that it hadn't confirmed — that `add_to_playlist()`'s `playlist.songs.append(song)` might not correctly populate `position`/`added_by` on `playlist_entries`, since those columns are `nullable=False` with no defaults on a plain `secondary=` relationship. It recommended checking that separately rather than folding an unverified claim into the Issue #5 fix. I haven't verified this independently yet.
+- I made the final call on which 3 of the 5 bugs to fix myself; the assistant gave a recommendation (favoring distinct root-cause categories and existing test coverage) but I checked it against the actual bug reports before deciding, rather than taking the recommendation at face value.
+
 ## App structure at a glance
 
 Mixtape is a Flask + SQLAlchemy app where friends share songs, build collaborative playlists, and track listening stats. The app follows a strict three-layer structure: `app.py` wires everything together, `routes/` handles HTTP concerns, and `services/` holds all business logic. `models.py` defines the data itself.
