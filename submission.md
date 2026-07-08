@@ -79,17 +79,26 @@ Observed: `user.listening_streak` was `1` after the second call instead of `2`, 
 
 **Affected file:** `services/notification_service.py`
 
-**How I reproduced it:** Unlike Issue #1, this one has no time dependency, so it reproduces deterministically through the live API on any day, using the seeded data as-is.
+**How I reproduced it:** No timing dependency, so this reproduces deterministically through the live API on any day, using seed data as-is. Used two distinct users where the rater isn't the song's sharer — nova (`shared_by` on "Midnight Drive") and darius as the rater, since a self-rating shouldn't notify anyway. Sequence: baseline `GET /users/<nova_id>/notifications`, then `POST /songs/<midnight_drive_id>/rate` with `{"user_id": "<darius_id>", "score": 5}` (returned `201`, confirming the rating itself saved), then re-checked notifications — unchanged. As a contrast check, `POST /playlists/<id>/songs` with the same song and darius as `added_by` did produce a new `song_added_to_playlist` entry, confirming the asymmetry was isolated to the rating path.
 
-Inputs: two distinct users where the rater is not the song's original sharer — nova (`shared_by` on "Midnight Drive") and darius as the rater. This distinction matters because `rate_song()` has no self-rating guard, but a self-rating shouldn't produce a notification anyway (mirroring the `song.shared_by != added_by_user_id` check in `add_to_playlist()`), so the rater has to be someone other than the sharer to cleanly expose the bug rather than a false negative.
+**How I found the root cause:** Followed `routes/songs.py`'s `rate()` handler into its one call, `notification_service.rate_song()`, and read the whole function top to bottom. It validates the score, looks up the song and user, upserts the `Rating` row, and commits — nothing else. Comparing it line-by-line against `add_to_playlist()` right above it in the same file is what pinned down the cause: both functions follow the same lookup → mutate → commit shape, but `add_to_playlist()` has one more step afterward — a guarded call to `create_notification()` — that `rate_song()` simply doesn't have. `create_notification()`'s own docstring even lists `'song_rated'` as an example type, confirming the notification was meant to exist here and just never got wired up.
 
-Sequence: (1) baseline `GET /users/<nova_id>/notifications` — seed data pre-populates exactly one notification for nova, a `song_added_to_playlist` entry, unrelated to this song. (2) `POST /songs/<midnight_drive_id>/rate` with `{"user_id": "<darius_id>", "score": 5}` — returns `201` with the serialized `Rating`, confirming the rating itself saved correctly. (3) re-check `GET /users/<nova_id>/notifications` — the list is identical to step 1, no new entry, same count. (4) as a contrast check, `POST /playlists/<some_playlist_id>/songs` with `{"song_id": "<midnight_drive_id>", "added_by": "<darius_id>"}`, then a third `GET /users/<nova_id>/notifications` — this time a new `song_added_to_playlist` entry does appear, confirming the asymmetry is real and isolated to the rating path rather than notifications being broken generally.
+**The root cause:** `rate_song()` never calls `create_notification()` anywhere in its body. `add_to_playlist()`, which performs a structurally identical lookup/mutate/commit sequence, has an explicit follow-up call — `create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", ...)` — guarded by `song.shared_by != added_by_user_id`. `rate_song()` has no equivalent call at all: the rating gets saved correctly, but no notification is ever created for the sharer, regardless of who does the rating.
 
-Observed: rating a song never produces a notification for the song's sharer. Expected: a `song_rated`-style notification, matching the pattern already used for playlist adds.
+**My fix and side-effect check:** Added the missing call at the end of `rate_song()`, right after the rating commits, mirroring `add_to_playlist()`'s exact pattern:
 
-Root cause, traced: `routes/songs.py: rate()` calls `notification_service.rate_song(user_id, song_id, score)`, which validates the score, looks up the song and user, upserts the `Rating` row, and commits — there is no call to `create_notification()` anywhere in the function body. `add_to_playlist()` performs the analogous lookup/mutate/commit sequence but explicitly calls `create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", ...)` afterward; `rate_song()` simply has no equivalent line.
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score} stars.",
+    )
+```
 
-This also reproduces at the function level without running the server: build an in-memory app/DB, create two `User`s and a `Song` with `shared_by` set to one of them, call `rate_song(other_user.id, song.id, 5)`, then call `get_notifications(sharer.id)` and confirm the list length is unchanged.
+The `song.shared_by != user_id` guard prevents self-notifications when someone rates their own shared song, matching the guard already used in `add_to_playlist()`. This fires on every successful rating, including updates to an existing rating, keeping parity with `add_to_playlist()`'s own behavior (which also notifies on every call, not just the first).
+
+Checked side effects: `rate_song()` is only called from `routes/songs.py`'s `rate()` handler and its return value/type is unchanged, so nothing downstream breaks. `Notification.to_dict()` and `get_notifications()` are generic over `notification_type`, with no special-casing that would choke on the new `"song_rated"` value. Wrote `tests/test_notifications.py` (no prior test file existed for this service) covering: rating someone else's song notifies the sharer with the right type and body, rating your own song notifies no one, and updating an existing rating notifies again — all three pass.
 
 ### Issue #5 — The last song in a playlist never shows up
 
