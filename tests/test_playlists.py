@@ -84,3 +84,39 @@ def test_empty_playlist_returns_empty_list(app):
 
         songs = get_playlist_songs(playlist.id)
         assert songs == []
+
+
+def test_playlist_with_one_song_returns_that_song(app):
+    """
+    A playlist with exactly one song should still return it.
+
+    This is the sharpest edge of the off-by-one slice bug: [x][:-1] returns
+    [], so a single-song playlist would previously show up as completely
+    empty rather than just missing its "last" song.
+    """
+    with app.app_context():
+        user = User(username="soloist", email="soloist@example.com")
+        db.session.add(user)
+        db.session.flush()
+
+        song = Song(title="Only Track", artist="Solo Artist", shared_by=user.id)
+        db.session.add(song)
+        db.session.flush()
+
+        playlist = Playlist(name="One Song Playlist", created_by=user.id)
+        db.session.add(playlist)
+        db.session.flush()
+
+        db.session.execute(
+            playlist_entries.insert().values(
+                playlist_id=playlist.id,
+                song_id=song.id,
+                position=1,
+                added_by=user.id,
+            )
+        )
+        db.session.commit()
+
+        songs = get_playlist_songs(playlist.id)
+        assert len(songs) == 1
+        assert songs[0]["title"] == "Only Track"
